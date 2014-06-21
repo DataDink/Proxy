@@ -3,7 +3,7 @@ Proxy
 
 A tiny System.Reflection.Emit based proxy solution
 
-This is an experimental single-class implementation. There is not tested for bugs or performance. Use at your own risk.
+This is an experimental single-class implementation. This is not tested for bugs or performance. Use at your own risk.
 
 ### Usage
 =========
