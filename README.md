@@ -5,6 +5,8 @@ A tiny System.Reflection.Emit based proxy solution
 
 This is an experimental single-class implementation. This is not tested for bugs or performance. Use at your own risk.
 
+Learn more on [My Blog](http://markernet.blogspot.com/2014/06/interface-proxy-with-emit.html)
+
 ### Usage
 =========
 
