@@ -146,7 +146,8 @@ namespace Proxy
             if (info.CanWrite) property.SetSetMethod(ConfigureMethod(builder, proxy, info.GetSetMethod()));
         }
 
-        // See MNelson or http://markernet.blogspot.com/2014/06/interface-proxy-with-emit.html
+        // Blog: http://markernet.blogspot.com/2014/06/interface-proxy-with-emit.html
+        // Github: https://github.com/DataDink/Proxy
         private static MethodBuilder ConfigureMethod(TypeBuilder builder, FieldInfo proxy, MethodInfo info)
         {
             var index = MemberIndex.First(m => m.Value == info).Key;
@@ -163,7 +164,8 @@ namespace Proxy
             return method;
         }
 
-        // See MNelson or http://markernet.blogspot.com/2014/06/interface-proxy-with-emit.html
+        // Blog: http://markernet.blogspot.com/2014/06/interface-proxy-with-emit.html
+        // Github: https://github.com/DataDink/Proxy
         private static void ConfigureMethodBody(ILGenerator encoder, FieldInfo proxy, MethodInfo method, int index)
         {
             var returnsVoid = method.ReturnType == typeof(void);
