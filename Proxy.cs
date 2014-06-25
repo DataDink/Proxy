@@ -6,25 +6,26 @@ using System.Reflection.Emit;
 
 namespace Proxy
 {
+    // ReSharper disable StaticFieldInGenericType
     public abstract class Proxy<T> where T : class
     {
         #region Static Cache (NOTE: This is per T)
         /// <summary>
         /// The dynamic proxy type 
         /// </summary>
-        protected static readonly Type InstanceType;
+        protected static readonly Type ProxyType;
         /// <summary>
         /// The type of T
         /// </summary>
         protected static readonly Type Interface;
 
-        private static readonly Dictionary<int, MethodInfo> MethodIndex;
+        private static readonly Dictionary<int, MemberInfo> MemberIndex;
         /// <summary>
         /// Looks up the MethodInfo for type T by index
         /// </summary>
-        public static MethodInfo Lookup(int index) { return MethodIndex[index]; }
+        public static MemberInfo Lookup(int index) { return MemberIndex[index]; }
 
-        private static AssemblyBuilder Assembly;
+        private readonly static AssemblyBuilder Assembly;
         /// <summary>
         /// Saves the underlying generated assembly to disk
         /// </summary>
@@ -32,11 +33,26 @@ namespace Proxy
 
         static Proxy()
         {
-            Interface = typeof(T);
-            if (!Interface.IsInterface) throw new InvalidOperationException(string.Format("{0} is not an interface", Interface.Name));
-            MethodIndex = Interface.GetMethods().Select((m, i) => new { m, i }).ToDictionary(i => i.i, m => m.m);
-            InstanceType = Generate();
+            Interface = GetInterfaceType();
+            MemberIndex = GenerateMemberIndex();
+            Assembly = GenerateAssembly();
+            ProxyType = GenerateProxy();
         }
+
+        private static Type GetInterfaceType()
+        {
+            var type = typeof (T);
+            if (!type.IsInterface) throw new InvalidOperationException(string.Format("{0} is not an interface", type.Name));
+            return type;
+        }
+
+        private static Dictionary<int, MemberInfo> GenerateMemberIndex()
+        {
+            return Interface.GetInterfaces().Concat(new[] {Interface})
+                .SelectMany(i => i.GetMembers())
+                .Select((member, index) => new {member, index})
+                .ToDictionary(m => m.index, m => m.member);
+        } 
         #endregion
 
         /// <summary>
@@ -48,7 +64,7 @@ namespace Proxy
         /// </summary>
         protected T Instance { get; private set; }
 
-        protected Proxy() { Instance = (T)Activator.CreateInstance(InstanceType, this); }
+        protected Proxy() { Instance = (T)Activator.CreateInstance(ProxyType, this); }
         protected Proxy(T target) : this() { Target = target; }
 
         /// <summary>
@@ -63,11 +79,11 @@ namespace Proxy
         }
 
         /// <summary>
-        /// Called prior to OnCall
+        /// When overridden called prior to OnCall
         /// </summary>
         protected virtual void BeforeCall(MethodInfo method, object[] parameters) { }
         /// <summary>
-        /// Called after OnCall
+        /// When overridden called after OnCall
         /// </summary>
         protected virtual void AfterCall(MethodInfo method, object[] parameters, object result) { }
         /// <summary>
@@ -75,23 +91,28 @@ namespace Proxy
         /// </summary>
         protected virtual object OnCall(MethodInfo method, object[] parameters)
         {
-            if (Target == null) return method.ReturnType.IsValueType ? Activator.CreateInstance(method.ReturnType) : null;
+            if (Target == null)
+                return method.ReturnType.IsValueType ? Activator.CreateInstance(method.ReturnType) : null;
             return method.Invoke(Target, parameters);
         }
 
         #region Emit Generation (
-        private static Type Generate()
+
+        private static AssemblyBuilder GenerateAssembly()
         {
             var rootname = new AssemblyName(Interface.Name + "Proxy_" + Guid.NewGuid());
-            var assembly = AppDomain.CurrentDomain.DefineDynamicAssembly(rootname, AssemblyBuilderAccess.RunAndSave);
-            var module = assembly.DefineDynamicModule(rootname.Name, rootname.Name + ".dll");
-            var builder = module.DefineType(rootname.Name + ".Proxy", TypeAttributes.Class, typeof(object), new[] { typeof(T) });
+            return AppDomain.CurrentDomain.DefineDynamicAssembly(rootname, AssemblyBuilderAccess.RunAndSave);
+        }
+
+        private static Type GenerateProxy()
+        {
+            var nspace = Assembly.GetName().Name;
+            var module = Assembly.DefineDynamicModule(nspace, nspace + ".dll");
+            var builder = module.DefineType(nspace + ".Proxy", TypeAttributes.Class, typeof(object), new[] { typeof(T) });
             var proxy = builder.DefineField("_proxy", typeof(Proxy<T>), FieldAttributes.Private);
 
             ConfigureConstructor(builder, proxy);
-            ConfigureInterface<T>(builder, proxy);
-
-            Assembly = assembly;
+            ImplementInterface(builder, proxy);
             return builder.CreateType();
         }
 
@@ -99,20 +120,15 @@ namespace Proxy
         {
             var ctor = builder.DefineConstructor(MethodAttributes.Public, CallingConventions.HasThis, new[] { typeof(Proxy<T>) });
             var ctorBase = typeof(object).GetConstructor(new Type[0]);
-            var encoder = ctor.GetILGenerator();
-            encoder.Emit(OpCodes.Ldarg_0);
-            encoder.Emit(OpCodes.Call, ctorBase);
-            encoder.Emit(OpCodes.Ldarg_0);
-            encoder.Emit(OpCodes.Ldarg_1);
-            encoder.Emit(OpCodes.Stfld, proxy);
-            encoder.Emit(OpCodes.Ret);
+            var encoder = ctor.GetILGenerator(); // Creates a constructor that sets the _proxy field
+            encoder.Emit(OpCodes.Ldarg_0); encoder.Emit(OpCodes.Call, ctorBase); encoder.Emit(OpCodes.Ldarg_0);
+            encoder.Emit(OpCodes.Ldarg_1); encoder.Emit(OpCodes.Stfld, proxy); encoder.Emit(OpCodes.Ret);
         }
 
-        private static void ConfigureInterface<TIFace>(TypeBuilder builder, FieldInfo proxy = null)
+        private static void ImplementInterface(TypeBuilder builder, FieldInfo proxy = null)
         {
-            var members = typeof(TIFace).GetMembers();
-            var methods = members.OfType<MethodInfo>().Where(m => !m.IsSpecialName).ToList();
-            var properties = members.OfType<PropertyInfo>().ToList();
+            var methods = MemberIndex.Values.OfType<MethodInfo>().Where(m => !m.IsSpecialName).ToList();
+            var properties = MemberIndex.Values.OfType<PropertyInfo>().ToList();
 
             methods.ForEach(m => ConfigureMethod(builder, proxy, m));
             properties.ForEach(p => ConfigureProperty(builder, proxy, p));
@@ -121,7 +137,7 @@ namespace Proxy
         private static void ConfigureProperty(TypeBuilder builder, FieldInfo proxy, PropertyInfo info)
         {
             var property = builder.DefineProperty(
-                info.Name,
+                string.Format("Explicit_{0}.{1}", Guid.NewGuid(), info.Name),
                 info.Attributes,
                 CallingConventions.HasThis,
                 info.PropertyType,
@@ -130,21 +146,25 @@ namespace Proxy
             if (info.CanWrite) property.SetSetMethod(ConfigureMethod(builder, proxy, info.GetSetMethod()));
         }
 
+        // See MNelson or http://markernet.blogspot.com/2014/06/interface-proxy-with-emit.html
         private static MethodBuilder ConfigureMethod(TypeBuilder builder, FieldInfo proxy, MethodInfo info)
         {
-            var index = MethodIndex.First(m => m.Value == info).Key;
+            var index = MemberIndex.First(m => m.Value == info).Key;
             var method = builder.DefineMethod(
-                info.Name,
-                (MethodAttributes.Public | MethodAttributes.Virtual | info.Attributes | MethodAttributes.Abstract) ^ MethodAttributes.Abstract,
+                string.Format("Explicit_{0}.{1}", Guid.NewGuid(), info.Name),
+                MethodAttributes.Private | MethodAttributes.Virtual | MethodAttributes.HideBySig | MethodAttributes.Final |
+                MethodAttributes.NewSlot | (info.Attributes & MethodAttributes.SpecialName),
                 CallingConventions.HasThis,
                 info.ReturnType,
                 info.GetParameters().Select(p => p.ParameterType).ToArray());
+            builder.DefineMethodOverride(method, info);
             var encoder = method.GetILGenerator();
-            ConfigureCall(encoder, proxy, info, index);
+            ConfigureMethodBody(encoder, proxy, info, index);
             return method;
         }
 
-        private static void ConfigureCall(ILGenerator encoder, FieldInfo proxy, MethodInfo method, int index)
+        // See MNelson or http://markernet.blogspot.com/2014/06/interface-proxy-with-emit.html
+        private static void ConfigureMethodBody(ILGenerator encoder, FieldInfo proxy, MethodInfo method, int index)
         {
             var returnsVoid = method.ReturnType == typeof(void);
             var returnsValue = !returnsVoid && method.ReturnType.IsValueType;
@@ -155,39 +175,24 @@ namespace Proxy
             encoder.DeclareLocal(returnsVoid ? typeof(object) : method.ReturnType); // return value (local 0)
             encoder.DeclareLocal(typeof(object[])); // parameters (local 1)
 
-            encoder.Emit(OpCodes.Ldarg_0); // this.
-            encoder.Emit(OpCodes.Ldfld, proxy); // this._proxy
-            encoder.Emit(OpCodes.Ldc_I4_S, index); // index of method to lookup
-            encoder.Emit(OpCodes.Call, lookup); // lookup methodinfo by index
-            encoder.Emit(OpCodes.Ldc_I4_S, arguments.Length); // set size of parameter array
-            encoder.Emit(OpCodes.Newarr, typeof(object)); // create parameter array
-            encoder.Emit(OpCodes.Stloc_1); // store to local 1
+            encoder.Emit(OpCodes.Ldarg_0); encoder.Emit(OpCodes.Ldfld, proxy); // this._proxy
+            encoder.Emit(OpCodes.Ldc_I4_S, index); encoder.Emit(OpCodes.Call, lookup); // lookup methodinfo by const index
+            encoder.Emit(OpCodes.Ldc_I4_S, arguments.Length); encoder.Emit(OpCodes.Newarr, typeof(object)); encoder.Emit(OpCodes.Stloc_1); // create parameter array
 
-            for (var i = 0; i < arguments.Length; i++)
-            { // load up parameter array values
+            for (var i = 0; i < arguments.Length; i++) { // load up parameter array values
                 var argument = arguments[i];
-                encoder.Emit(OpCodes.Ldloc_1); // get ready to add to array (local 1)
-                ConfigureLdc(encoder, i); // index to add to
+                encoder.Emit(OpCodes.Ldloc_1); ConfigureLdc(encoder, i); // get array item at index
                 ConfigureLdarg(encoder, i + 1); // get argument (index + 1)
                 if (argument.IsValueType) encoder.Emit(OpCodes.Box, argument); // convert to object if needed
-                encoder.Emit(OpCodes.Stelem_Ref); // push to array
+                encoder.Emit(OpCodes.Stelem_Ref); // push to array item
             }
 
             encoder.Emit(OpCodes.Ldloc_1); // get array
             encoder.Emit(OpCodes.Callvirt, interceptor); // pass stack to method
 
-            if (returnsValue)
-            {
-                encoder.Emit(OpCodes.Unbox_Any, method.ReturnType); // un-object a value
-            }
-            else if (!returnsVoid)
-            {
-                encoder.Emit(OpCodes.Castclass, method.ReturnType); // cast to return type
-            }
-            else
-            {
-                encoder.Emit(OpCodes.Pop); // discard return value
-            }
+            if (returnsValue) encoder.Emit(OpCodes.Unbox_Any, method.ReturnType); // un-object a value
+            else if (!returnsVoid) encoder.Emit(OpCodes.Castclass, method.ReturnType); // cast to return type
+            else  encoder.Emit(OpCodes.Pop); // discard return value
             encoder.Emit(OpCodes.Ret);
         }
 
