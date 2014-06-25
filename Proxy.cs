@@ -18,13 +18,13 @@ namespace Proxy
         /// </summary>
         protected static readonly Type Interface;
 
-        private static readonly Dictionary<int, MethodInfo> MethodIndex;
+        private static readonly Dictionary<int, MemberInfo> MemberIndex;
         /// <summary>
         /// Looks up the MethodInfo for type T by index
         /// </summary>
-        public static MethodInfo Lookup(int index) { return MethodIndex[index]; }
+        public static MemberInfo Lookup(int index) { return MemberIndex[index]; }
 
-        private static AssemblyBuilder Assembly;
+        private static readonly AssemblyBuilder Assembly;
         /// <summary>
         /// Saves the underlying generated assembly to disk
         /// </summary>
@@ -34,8 +34,9 @@ namespace Proxy
         {
             Interface = typeof(T);
             if (!Interface.IsInterface) throw new InvalidOperationException(string.Format("{0} is not an interface", Interface.Name));
-            MethodIndex = Interface.GetMethods().Select((m, i) => new { m, i }).ToDictionary(i => i.i, m => m.m);
-            InstanceType = Generate();
+            MemberIndex = GenerateMemberIndex();
+            Assembly = GenerateAssembly();
+            InstanceType = GenerateInstance();
         }
         #endregion
 
@@ -75,24 +76,36 @@ namespace Proxy
         /// </summary>
         protected virtual object OnCall(MethodInfo method, object[] parameters)
         {
+            if (method.ReturnType == typeof (void)) return null;
             if (Target == null) return method.ReturnType.IsValueType ? Activator.CreateInstance(method.ReturnType) : null;
             return method.Invoke(Target, parameters);
         }
 
         #region Emit Generation (
-        private static Type Generate()
+        private static AssemblyBuilder GenerateAssembly()
         {
             var rootname = new AssemblyName(Interface.Name + "Proxy_" + Guid.NewGuid());
-            var assembly = AppDomain.CurrentDomain.DefineDynamicAssembly(rootname, AssemblyBuilderAccess.RunAndSave);
-            var module = assembly.DefineDynamicModule(rootname.Name, rootname.Name + ".dll");
-            var builder = module.DefineType(rootname.Name + ".Proxy", TypeAttributes.Class, typeof(object), new[] { typeof(T) });
+            return AppDomain.CurrentDomain.DefineDynamicAssembly(rootname, AssemblyBuilderAccess.RunAndSave);
+        }
+
+        private static Type GenerateInstance()
+        {
+            var name = Assembly.GetName().Name;
+            var module = Assembly.DefineDynamicModule(name, name + ".dll");
+            var builder = module.DefineType(name + ".Proxy", TypeAttributes.Class, typeof(object), new[] { typeof(T) });
             var proxy = builder.DefineField("_proxy", typeof(Proxy<T>), FieldAttributes.Private);
 
             ConfigureConstructor(builder, proxy);
-            ConfigureInterface<T>(builder, proxy);
+            ConfigureInterface(builder, proxy);
 
-            Assembly = assembly;
             return builder.CreateType();
+        }
+
+        private static Dictionary<int, MemberInfo> GenerateMemberIndex()
+        {
+            return typeof(T).GetInterfaces().Concat(new[] { typeof(T) }).SelectMany(i => i.GetMembers())
+                             .Select((member, index) => new { member, index })
+                             .ToDictionary(m => m.index, m => m.member);
         }
 
         private static void ConfigureConstructor(TypeBuilder builder, FieldInfo proxy)
@@ -108,11 +121,10 @@ namespace Proxy
             encoder.Emit(OpCodes.Ret);
         }
 
-        private static void ConfigureInterface<TIFace>(TypeBuilder builder, FieldInfo proxy = null)
+        private static void ConfigureInterface(TypeBuilder builder, FieldInfo proxy = null)
         {
-            var members = typeof(TIFace).GetMembers();
-            var methods = members.OfType<MethodInfo>().Where(m => !m.IsSpecialName).ToList();
-            var properties = members.OfType<PropertyInfo>().ToList();
+            var methods = MemberIndex.Values.OfType<MethodInfo>().Where(m => !m.IsSpecialName).ToList();
+            var properties = MemberIndex.Values.OfType<PropertyInfo>().ToList();
 
             methods.ForEach(m => ConfigureMethod(builder, proxy, m));
             properties.ForEach(p => ConfigureProperty(builder, proxy, p));
@@ -121,7 +133,7 @@ namespace Proxy
         private static void ConfigureProperty(TypeBuilder builder, FieldInfo proxy, PropertyInfo info)
         {
             var property = builder.DefineProperty(
-                info.Name,
+                string.Format("{0}.{1}", info.DeclaringType.Name, info.Name),
                 info.Attributes,
                 CallingConventions.HasThis,
                 info.PropertyType,
@@ -132,19 +144,22 @@ namespace Proxy
 
         private static MethodBuilder ConfigureMethod(TypeBuilder builder, FieldInfo proxy, MethodInfo info)
         {
-            var index = MethodIndex.First(m => m.Value == info).Key;
+            var index = MemberIndex.First(m => m.Value == info).Key;
             var method = builder.DefineMethod(
-                info.Name,
-                (MethodAttributes.Public | MethodAttributes.Virtual | info.Attributes | MethodAttributes.Abstract) ^ MethodAttributes.Abstract,
+                string.Format("{0}.{1}", info.DeclaringType.Name, info.Name),
+                MethodAttributes.Private | MethodAttributes.Virtual | MethodAttributes.HideBySig | 
+                MethodAttributes.NewSlot | MethodAttributes.Final | (info.Attributes & MethodAttributes.SpecialName),
                 CallingConventions.HasThis,
                 info.ReturnType,
                 info.GetParameters().Select(p => p.ParameterType).ToArray());
+            builder.DefineMethodOverride(method, info);
+
             var encoder = method.GetILGenerator();
-            ConfigureCall(encoder, proxy, info, index);
+            ConfigureBody(encoder, proxy, info, index);
             return method;
         }
 
-        private static void ConfigureCall(ILGenerator encoder, FieldInfo proxy, MethodInfo method, int index)
+        private static void ConfigureBody(ILGenerator encoder, FieldInfo proxy, MethodInfo method, int index)
         {
             var returnsVoid = method.ReturnType == typeof(void);
             var returnsValue = !returnsVoid && method.ReturnType.IsValueType;
